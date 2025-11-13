@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""
+Video Swiss Army Knife - A comprehensive video processing tool
+Combines multiple video processing operations into a single menu-driven interface.
+
+Version: 1.0.0 (Artifact Version 19)
+Author: Created by merging and enhancing multiple video processing scripts
+Date: 2024
+Requirements: Ubuntu 24.04, Python 3.10+, FFmpeg, untrunc (for repair option)
+"""
+
+import os
+import sys
+import subprocess
+import shutil
+import shlex
+import tempfile
+import logging
+import traceback
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import List, Tuple, Optional, Dict
+import json
+
+# Configure logging
+LOG_FILE = "video_processor.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='a'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Common video extensions
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.m4v', '.mpg', '.mpeg', '.3gp', '.asf'}
+
+class VideoProcessor:
+    """Main class for video processing operations"""
+    
+    def __init__(self):
+        self.temp_dir = None
+        self.processed_count = 0
+        self.skipped_count = 0
+        self.error_count = 0
+        self.skipped_files = []
+        self.error_files = []
+        
+    def __enter__(self):
+        """Create temporary directory on context entry"""
+        self.temp_dir = tempfile.mkdtemp(prefix="video_processor_")
+        logger.info(f"Created temporary directory: {self.temp_dir}")
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean up temporary directory on context exit"""
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+            logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
+    
+    def run_command(self, cmd: List[str], capture_output: bool = True, 
+                   show_progress: bool = False) -> subprocess.CompletedProcess:
+        """
+        Run a command with nice priority
+        
+        Args:
+            cmd: Command and arguments as list
+            capture_output: Whether to capture stdout/stderr
+            show_progress: Whether to show FFmpeg progress
+        
+        Returns:
+            CompletedProcess instance
+        """
+        # Prepend nice command
+        nice_cmd = ['nice', '-n', '19'] + cmd
+        
+        logger.debug(f"Running command: {' '.join(shlex.quote(c) for c in nice_cmd)}")
+        
+        if show_progress and cmd[0].endswith('ffmpeg'):
+            # Show the actual FFmpeg command being run
+            logger.info(f"Executing: {' '.join(shlex.quote(c) for c in cmd)}")
+            # For FFmpeg with progress, use popen to capture progress
+            return self._run_ffmpeg_with_progress(nice_cmd)
+        else:
+            return subprocess.run(
+                nice_cmd,
+                capture_output=capture_output,
+                text=True,
+                check=False
+            )
+    
+    def _run_ffmpeg_with_progress(self, cmd: List[str]) -> subprocess.CompletedProcess:
+        """Run FFmpeg command and display progress"""
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        stderr_lines = []
+        last_progress_line = ""
+        while True:
+            line = process.stderr.readline()
+            if not line:
+                break
+            stderr_lines.append(line)
+            
+            # Parse FFmpeg progress
+            if "time=" in line and "speed=" in line:
+                # Extract time and speed for progress display
+                time_match = re.search(r'time=(\d+:\d+:\d+\.\d+)', line)
+                speed_match = re.search(r'speed=(\d+\.?\d*x)', line)
+                if time_match and speed_match:
+                    last_progress_line = f"\rProgress: {time_match.group(1)} @ {speed_match.group(1)}"
+                    print(last_progress_line, end='', flush=True)
+        
+        if last_progress_line:
+            print()  # New line after progress
+        
+        process.wait()
+        
+        # If there was an error, show the last few lines of stderr
+        if process.returncode != 0:
+            error_lines = [line.strip() for line in stderr_lines if line.strip()]
+            if error_lines:
+                logger.error("FFmpeg error output:")
+                # Show last 10 meaningful lines
+                for line in error_lines[-10:]:
+                    logger.error(f"  {line}")
+        
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=process.returncode,
+            stdout='',
+            stderr=''.join(stderr_lines)
+        )
+    
+    def get_video_files(self, extensions: set = None) -> List[Path]:
+        """Get all video files in current directory"""
+        if extensions is None:
+            extensions = VIDEO_EXTENSIONS
+        
+        files = []
+        for file in Path('.').iterdir():
+            if file.is_file() and file.suffix.lower() in extensions:
+                files.append(file)
+        return sorted(files)
+    
+    def get_video_info(self, filepath: Path) -> Dict:
+        """Get video information using ffprobe"""
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-print_format', 'json',
+            '-show_streams',
+            str(filepath)
+        ]
+        
+        result = self.run_command(cmd)
+        if result.returncode != 0:
+            return {}
+        
+        try:
+            data = json.loads(result.stdout)
+            info = {'video': None, 'audio': None}
+            
+            for stream in data.get('streams', []):
+                if stream['codec_type'] == 'video' and not info['video']:
+                    info['video'] = {
+                        'width': stream.get('width', 0),
+                        'height': stream.get('height', 0),
+                        'fps': eval(stream.get('r_frame_rate', '0/1')),
+                        'codec': stream.get('codec_name', 'unknown')
+                    }
+                elif stream['codec_type'] == 'audio' and not info['audio']:
+                    info['audio'] = {
+                        'codec': stream.get('codec_name', 'unknown'),
+                        'sample_rate': stream.get('sample_rate', '0')
+                    }
+            
+            return info
+        except:
+            return {}
+    
+    def process_files(self, files: List[Path], operation_name: str, 
+                     process_func, *args, **kwargs):
+        """
+        Generic file processing with progress tracking
+        
+        Args:
+            files: List of files to process
+            operation_name: Name of the operation for logging
+            process_func: Function to call for each file
+            *args, **kwargs: Additional arguments for process_func
+        """
+        self.processed_count = 0
+        self.skipped_count = 0
+        self.error_count = 0
+        self.skipped_files = []
+        self.error_files = []
+        
+        total_files = len(files)
+        logger.info(f"Starting {operation_name} on {total_files} files")
+        
+        for idx, file in enumerate(files, 1):
+            print(f"\n{'='*60}")
+            print(f"Processing file {idx} of {total_files}: {file.name}")
+            print(f"{'='*60}")
+            
+            try:
+                result = process_func(file, *args, **kwargs)
+                if result == 'skipped':
+                    self.skipped_count += 1
+                    self.skipped_files.append(str(file))
+                elif result == 'error':
+                    self.error_count += 1
+                    self.error_files.append(str(file))
+                else:
+                    self.processed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error processing {file}: {e}")
+                logger.debug(traceback.format_exc())
+                self.error_count += 1
+                self.error_files.append(str(file))
+        
+        self._print_summary(operation_name)
+    
+    def _print_summary(self, operation_name: str):
+        """Print and log operation summary"""
+        summary = f"\n{'='*60}\n"
+        summary += f"{operation_name} Summary:\n"
+        summary += f"Files processed successfully: {self.processed_count}\n"
+        summary += f"Files skipped: {self.skipped_count}\n"
+        if self.skipped_files:
+            summary += f"  Skipped files: {', '.join(self.skipped_files)}\n"
+        summary += f"Files with errors: {self.error_count}\n"
+        if self.error_files:
+            summary += f"  Error files: {', '.join(self.error_files)}\n"
+        summary += f"{'='*60}\n"
+        
+        print(summary)
+        logger.info(summary)
+    
+    # === Operation 1: Reverse and Append Video ===
+    def reverse_append_video(self):
+        """Create videos with reversed version appended"""
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        # Show file list and let user select one
+        print("\nSelect video file to process:")
+        for i, file in enumerate(files, 1):
+            print(f"{i}. {file.name}")
+        
+        try:
+            choice = int(input("Enter file number: ").strip()) - 1
+            if choice < 0 or choice >= len(files):
+                raise ValueError()
+            selected_file = files[choice]
+        except (ValueError, IndexError):
+            logger.error("Invalid selection")
+            return
+        
+        print(f"\nSelected: {selected_file.name}")
+        print("1. Append reversed video BEFORE original")
+        print("2. Append reversed video AFTER original")
+        choice = input("Select option (1-2): ").strip()
+        
+        if choice not in ['1', '2']:
+            logger.error("Invalid choice")
+            return
+        
+        mode = '-before' if choice == '1' else '-after'
+        
+        def process_reverse(file: Path, mode: str):
+            output_file = file.with_name(f"{file.stem}_edit.mkv")
+            
+            if output_file.exists():
+                logger.info(f"Output file already exists: {output_file}")
+                return 'skipped'
+            
+            # Check if already FFV1 level 3 with no audio
+            if self._is_ffv1_level3_no_audio(file):
+                logger.info(f"{file} is already FFV1 level 3 with no audio")
+                working_src = file
+            else:
+                # Convert to FFV1 level 3
+                ffv1_src = Path(self.temp_dir) / f"{file.stem}_ffv1.mkv"
+                if not self._convert_to_ffv1(file, ffv1_src):
+                    return 'error'
+                working_src = ffv1_src
+            
+            # Create reversed version
+            reversed_vid = Path(self.temp_dir) / f"{file.stem}_reversed.mkv"
+            if not self._reverse_video(working_src, reversed_vid):
+                return 'error'
+            
+            # Concatenate based on mode
+            if mode == '-before':
+                first, second = reversed_vid, working_src
+            else:
+                first, second = working_src, reversed_vid
+            
+            return self._concat_videos(first, second, output_file)
+        
+        self.process_files([selected_file], "Reverse and Append", process_reverse, mode)
+    
+    def _is_ffv1_level3_no_audio(self, file: Path) -> bool:
+        """Check if video is FFV1 level 3 with no audio"""
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name,level',
+            '-of', 'default=noprint_wrappers=1',
+            str(file)
+        ]
+        
+        result = self.run_command(cmd)
+        if result.returncode != 0:
+            return False
+        
+        output = result.stdout
+        has_ffv1_level3 = 'codec_name=ffv1' in output and 'level=3' in output
+        
+        if not has_ffv1_level3:
+            return False
+        
+        # Check for audio
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'a',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'default=noprint_wrappers=1',
+            str(file)
+        ]
+        
+        result = self.run_command(cmd)
+        return result.stdout.strip() == ''
+    
+    def _convert_to_ffv1(self, src: Path, dst: Path) -> bool:
+        """Convert video to FFV1 level 3 with no audio"""
+        logger.info(f"Converting {src} to FFV1 level 3...")
+        
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(src),
+            '-map', '0:v:0',
+            '-c:v', 'ffv1', '-level', '3',
+            '-an',
+            str(dst)
+        ]
+        
+        result = self.run_command(cmd, show_progress=True)
+        return result.returncode == 0
+    
+    def _reverse_video(self, src: Path, dst: Path) -> bool:
+        """Create reversed version of video"""
+        logger.info(f"Creating reversed version of {src}...")
+        
+        # Get video info
+        info = self.get_video_info(src)
+        if not info.get('video'):
+            logger.error("Could not get video info")
+            return False
+        
+        # Get duration
+        probe_cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(src)
+        ]
+        
+        result = self.run_command(probe_cmd)
+        duration = 0
+        if result.returncode == 0:
+            try:
+                duration = float(result.stdout.strip())
+            except:
+                pass
+        
+        if duration > 300:  # More than 5 minutes
+            logger.warning(f"Video is {duration:.1f} seconds long!")
+            logger.warning("The reverse filter loads entire video into RAM - this may freeze your system!")
+            logger.warning("Consider splitting the video into smaller segments first.")
+            
+            response = input("Continue anyway? (y/N): ").strip().lower()
+            if response != 'y':
+                logger.info("Operation cancelled by user")
+                return False
+        
+        # Add memory limit to FFmpeg command
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(src),
+            '-vf', 'reverse',
+            '-an',
+            '-c:v', 'ffv1', '-level', '3',
+            # Limit decoder threads to reduce memory usage
+            '-threads', '2',
+            '-filter_threads', '2',
+            str(dst)
+        ]
+        
+        logger.warning("Reversing video - this is very memory intensive!")
+        result = self.run_command(cmd, show_progress=True)
+        return result.returncode == 0
+    
+    def _concat_videos(self, first: Path, second: Path, output: Path) -> str:
+        """Re-encode and combine two videos into a new FFV1 file"""
+        logger.info(f"Re-encoding and combining videos to {output}...")
+        
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(first),
+            '-i', str(second),
+            '-filter_complex', '[0:v:0][1:v:0]concat=n=2:v=1[outv]',
+            '-map', '[outv]',
+            '-c:v', 'ffv1', '-level', '3',
+            '-an',
+            str(output)
+        ]
+        
+        result = self.run_command(cmd, show_progress=True)
+        return 'processed' if result.returncode == 0 else 'error'
+    
+    # === Operation 2: Remove Spaces from Filenames ===
+    def remove_spaces_from_filenames(self):
+        """Replace spaces with underscores in filenames"""
+        files = [f for f in Path('.').iterdir() if f.is_file() and ' ' in f.name]
+        
+        if not files:
+            logger.info("No files with spaces found in current directory")
+            return
+        
+        def process_rename(file: Path):
+            new_name = file.name.replace(' ', '_')
+            new_path = file.parent / new_name
+            
+            if new_path.exists():
+                logger.warning(f"Target filename already exists: {new_name}")
+                return 'skipped'
+            
+            try:
+                file.rename(new_path)
+                logger.info(f"Renamed: {file.name} -> {new_name}")
+                return 'processed'
+            except Exception as e:
+                logger.error(f"Failed to rename {file.name}: {e}")
+                return 'error'
+        
+        self.process_files(files, "Remove Spaces from Filenames", process_rename)
+    
+    # === Operation 3: Create Slow Motion Videos ===
+    def create_slow_motion(self):
+        """Create slow motion versions of videos"""
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        print("\nSlow Motion Creation")
+        print("1. 2x slower (half speed)")
+        print("2. 3.33x slower")
+        choice = input("Select option (1-2): ").strip()
+        
+        if choice not in ['1', '2']:
+            logger.error("Invalid choice")
+            return
+        
+        factor = 2.0 if choice == '1' else 3.3333
+        
+        def process_slomo(file: Path, factor: float):
+            info = self.get_video_info(file)
+            if not info.get('video'):
+                logger.error(f"Could not get video info for {file}")
+                return 'error'
+            
+            fps = info['video']['fps']
+            if fps <= 0:
+                logger.error(f"Invalid FPS for {file}")
+                return 'error'
+            
+            new_fps = fps / factor
+            output_file = file.with_name(f"{round(new_fps)}fps_{file.stem}_slomo.mkv")
+            
+            if output_file.exists():
+                logger.info(f"Output file already exists: {output_file}")
+                return 'skipped'
+            
+            logger.info(f"Creating slow motion: {fps:.2f} fps -> {new_fps:.2f} fps")
+            
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'info',
+                '-i', str(file),
+                '-vf', f'setpts={factor}*PTS',
+                '-r', str(round(new_fps)),
+                '-c:v', 'ffv1', '-level', '3', '-g', '1',
+                '-an',
+                str(output_file)
+            ]
+            
+            result = self.run_command(cmd, show_progress=True)
+            
+            if result.returncode != 0:
+                # If conversion failed, try to clean up partial output
+                if output_file.exists():
+                    try:
+                        output_file.unlink()
+                        logger.info("Removed partial output file")
+                    except:
+                        pass
+                return 'error'
+            
+            return 'processed'
+        
+        self.process_files(files, "Slow Motion Creation", process_slomo, factor)
+    
+    # === Operation 4: Move Videos by Resolution ===
+    def move_videos_by_resolution(self):
+        """Move videos based on exact resolution criteria"""
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        # Get target resolution from user
+        print("\nEnter target resolution:")
+        try:
+            target_width = int(input("Target width (e.g., 1920): ").strip())
+            target_height = int(input("Target height (e.g., 1080): ").strip())
+        except ValueError:
+            logger.error("Invalid input. Please enter numbers only.")
+            return
+        
+        print(f"\nTarget resolution: {target_width}x{target_height}")
+        print("Select videos to move:")
+        print("1. Videos OVER target resolution (width > {0} OR height > {1})".format(target_width, target_height))
+        print("2. Videos UNDER target resolution (width < {0} OR height < {1})".format(target_width, target_height))
+        print("3. Videos NOT EXACTLY target resolution (width != {0} OR height != {1})".format(target_width, target_height))
+        
+        choice = input("Select option (1-3): ").strip()
+        if choice not in ['1', '2', '3']:
+            logger.error("Invalid choice")
+            return
+        
+        # Determine folder name and criteria
+        if choice == '1':
+            folder_name = f"over_{target_width}x{target_height}"
+            def meets_criteria(w, h):
+                return w > target_width or h > target_height
+        elif choice == '2':
+            folder_name = f"under_{target_width}x{target_height}"
+            def meets_criteria(w, h):
+                return w < target_width or h < target_height
+        else:  # choice == '3'
+            folder_name = f"not_{target_width}x{target_height}"
+            def meets_criteria(w, h):
+                return w != target_width or h != target_height
+        
+        # Create target directory
+        target_dir = Path(folder_name)
+        target_dir.mkdir(exist_ok=True)
+        logger.info(f"Using directory: {target_dir}")
+        
+        def process_resolution(file: Path):
+            info = self.get_video_info(file)
+            if not info.get('video'):
+                logger.error(f"Could not get video info for {file}")
+                return 'error'
+            
+            width = info['video']['width']
+            height = info['video']['height']
+            logger.info(f"Resolution: {width}x{height}")
+            
+            if meets_criteria(width, height):
+                dest_path = target_dir / file.name
+                if dest_path.exists():
+                    logger.warning(f"File already exists in {folder_name}: {file.name}")
+                    return 'skipped'
+                
+                try:
+                    shutil.move(str(file), str(dest_path))
+                    logger.info(f"Moved to {folder_name}: {file.name}")
+                    return 'processed'
+                except Exception as e:
+                    logger.error(f"Failed to move {file.name}: {e}")
+                    return 'error'
+            else:
+                logger.info(f"Does not meet criteria, keeping in place: {file.name}")
+                return 'skipped'
+        
+        self.process_files(files, f"Move Videos by Resolution ({folder_name})", process_resolution)
+    
+    # === Operation 5: Move High FPS Videos ===
+    def move_high_fps_videos(self):
+        """Move videos with >30 fps to high_fps folder"""
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        # Create high_fps directory if needed
+        highfps_dir = Path('high_fps')
+        highfps_dir.mkdir(exist_ok=True)
+        logger.info(f"Using high_fps directory: {highfps_dir}")
+        
+        def process_highfps(file: Path):
+            info = self.get_video_info(file)
+            if not info.get('video'):
+                logger.error(f"Could not get video info for {file}")
+                return 'error'
+            
+            fps = info['video']['fps']
+            logger.info(f"FPS: {fps:.2f}")
+            
+            if fps > 30:
+                dest_path = highfps_dir / file.name
+                if dest_path.exists():
+                    logger.warning(f"File already exists in high_fps: {file.name}")
+                    return 'skipped'
+                
+                try:
+                    shutil.move(str(file), str(dest_path))
+                    logger.info(f"Moved to high_fps: {file.name}")
+                    return 'processed'
+                except Exception as e:
+                    logger.error(f"Failed to move {file.name}: {e}")
+                    return 'error'
+            else:
+                logger.info(f"FPS <= 30, keeping in place: {file.name}")
+                return 'skipped'
+        
+        self.process_files(files, "Move High FPS Videos", process_highfps)
+    
+    # === Operation 6: Repair WMV/ASF Files ===
+    def repair_wmv_files(self):
+        """Repair corrupted WMV/ASF files using ProRes"""
+        files = self.get_video_files({'.wmv', '.asf'})
+        if not files:
+            logger.warning("No WMV/ASF files found in current directory")
+            return
+        
+        # Show file list and let user select one
+        print("\nSelect WMV/ASF file to repair:")
+        for i, file in enumerate(files, 1):
+            print(f"{i}. {file.name}")
+        
+        try:
+            choice = int(input("Enter file number: ").strip()) - 1
+            if choice < 0 or choice >= len(files):
+                raise ValueError()
+            selected_file = files[choice]
+        except (ValueError, IndexError):
+            logger.error("Invalid selection")
+            return
+        
+        def process_repair(file: Path):
+            output_file = file.with_name(f"{file.stem}_repaired.mov")
+            
+            if output_file.exists():
+                logger.info(f"Output file already exists: {output_file}")
+                return 'skipped'
+            
+            # Step 1: Try to rebuild ASF container
+            logger.info("Attempting to rebuild ASF container...")
+            fixed_asf = Path(self.temp_dir) / "fixed.asf"
+            
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'info',
+                '-fflags', '+genpts',
+                '-err_detect', 'ignore_err',
+                '-i', str(file),
+                '-map', '0', '-c', 'copy', '-y',
+                str(fixed_asf)
+            ]
+            
+            result = self.run_command(cmd)
+            input_for_transcode = fixed_asf if result.returncode == 0 else file
+            
+            # Step 2: Transcode to ProRes + AAC
+            logger.info("Transcoding to ProRes 422 HQ & AAC...")
+            
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'info',
+                '-fflags', '+genpts',
+                '-err_detect', 'ignore_err',
+                '-i', str(input_for_transcode),
+                '-map', '0:v:0',
+                '-c:v', 'prores_ks',
+                '-profile:v', '3',  # 422 HQ
+                '-pix_fmt', 'yuv422p10le',
+                '-g', '1',
+                '-vendor', 'apl0',
+                '-map', '0:a:0?',
+                '-af', 'aresample=async=1:min_hard_comp=0.100:first_pts=0',
+                '-c:a', 'aac',
+                '-b:a', '256k',
+                '-ar', '48000',
+                '-movflags', '+write_colr+faststart',
+                '-y', str(output_file)
+            ]
+            
+            result = self.run_command(cmd, show_progress=True)
+            
+            if result.returncode == 0:
+                # Verify output
+                verify_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-read_intervals', '%+#1',
+                    '-show_frames', '-select_streams', 'v:0',
+                    str(output_file)
+                ]
+                verify_result = self.run_command(verify_cmd)
+                
+                if verify_result.returncode == 0:
+                    logger.info(f"Successfully repaired: {output_file}")
+                    return 'processed'
+                else:
+                    logger.error("Output verification failed")
+                    if output_file.exists():
+                        output_file.unlink()
+                    return 'error'
+            else:
+                return 'error'
+        
+        self.process_files([selected_file], "Repair WMV/ASF Files", process_repair)
+    
+    # === Operation 7: Convert MKV to H.265 MP4 ===
+    def convert_mkv_to_h265(self):
+        """Convert MKV files to H.265 MP4"""
+        files = self.get_video_files({'.mkv'})
+        if not files:
+            logger.warning("No MKV files found in current directory")
+            return
+        
+        def process_h265(file: Path):
+            output_file = file.with_name(f"{file.stem}-fresh.mp4")
+            
+            if output_file.exists():
+                logger.info(f"Output file already exists: {output_file}")
+                return 'skipped'
+            
+            info = self.get_video_info(file)
+            if not info.get('video'):
+                logger.error(f"Could not get video info for {file}")
+                return 'error'
+            
+            width = info['video']['width']
+            height = info['video']['height']
+            logger.info(f"Input resolution: {width}x{height}")
+            
+            cmd = [
+                'ffmpeg', '-loglevel', 'info',
+                '-i', str(file),
+                '-c:v', 'libx265',
+                '-preset', 'veryslow',
+                '-tune', 'fastdecode',
+                '-crf', '13'
+            ]
+            
+            # Add scaling if needed
+            if width > 1920 or height > 1080:
+                # Scale to fit within 1920x1080, then ensure dimensions are even
+                # The scale=-2 ensures width is even, and we'll round height down to even
+                cmd.extend(['-vf', 'scale=w=min(1920\\,iw):h=min(1080\\,ih):force_original_aspect_ratio=decrease:flags=lanczos,scale=trunc(iw/2)*2:trunc(ih/2)*2'])
+                logger.info("Scaling to fit within 1920x1080 (ensuring even dimensions)")
+            
+            cmd.extend([
+                '-c:a', 'copy',
+                '-movflags', '+faststart',
+                str(output_file)
+            ])
+            
+            result = self.run_command(cmd, show_progress=True)
+            return 'processed' if result.returncode == 0 else 'error'
+        
+        self.process_files(files, "Convert MKV to H.265 MP4", process_h265)
+    
+    # === Operation 8: Convert Videos to WebM ===
+    def convert_to_webm(self):
+        """Convert videos to VP8/WebM format"""
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        def process_webm(file: Path):
+            output_file = file.with_name(f"{file.stem}_hd.webm")
+            
+            if output_file.exists():
+                logger.info(f"Output file already exists: {output_file}")
+                return 'skipped'
+            
+            info = self.get_video_info(file)
+            if not info.get('video'):
+                logger.error(f"Could not get video info for {file}")
+                return 'error'
+            
+            width = info['video']['width']
+            height = info['video']['height']
+            fps = info['video']['fps']
+            
+            logger.info(f"Input: {width}x{height} @ {fps:.2f} fps")
+            
+            # Build filter chain
+            filters = []
+            if fps > 30:
+                filters.append('fps=30')
+                logger.info("Limiting to 30 fps")
+            
+            if height > 720:
+                filters.append('scale=-1:720:flags=lanczos')
+                logger.info("Scaling to 720p")
+            
+            vf_filter = ','.join(filters) if filters else None
+            
+            cmd = [
+                'ffmpeg', '-i', str(file),
+                '-c:v', 'libvpx',
+                '-b:v', '2M',
+                '-crf', '10'
+            ]
+            
+            if vf_filter:
+                cmd.extend(['-vf', vf_filter])
+            
+            cmd.extend([
+                '-c:a', 'libvorbis',
+                '-q:a', '4',
+                str(output_file)
+            ])
+            
+            result = self.run_command(cmd, show_progress=True)
+            return 'processed' if result.returncode == 0 else 'error'
+        
+        self.process_files(files, "Convert to WebM", process_webm)
+    
+    # === Operation 9: Split Video into Scenes ===
+    def split_into_scenes(self):
+        """Split videos into individual scenes"""
+        try:
+            from scenedetect import VideoManager, SceneManager
+            from scenedetect.detectors import ContentDetector
+        except ImportError:
+            logger.error("PySceneDetect not installed. Install with: pip install scenedetect[opencv]")
+            return
+        
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        # Show file list and let user select one
+        print("\nSelect video file to split into scenes:")
+        for i, file in enumerate(files, 1):
+            print(f"{i}. {file.name}")
+        
+        try:
+            choice = int(input("Enter file number: ").strip()) - 1
+            if choice < 0 or choice >= len(files):
+                raise ValueError()
+            selected_file = files[choice]
+        except (ValueError, IndexError):
+            logger.error("Invalid selection")
+            return
+        
+        threshold = input("Enter scene detection threshold (default: 30.0): ").strip()
+        try:
+            threshold = float(threshold) if threshold else 30.0
+        except ValueError:
+            threshold = 30.0
+        
+        def process_scenes(file: Path):
+            logger.info(f"Detecting scenes with threshold {threshold}...")
+            
+            try:
+                # Detect scenes
+                video_manager = VideoManager([str(file)])
+                scene_manager = SceneManager()
+                scene_manager.add_detector(ContentDetector(threshold=threshold))
+                
+                video_manager.set_downscale_factor()
+                video_manager.start()
+                scene_manager.detect_scenes(frame_source=video_manager)
+                scene_list = scene_manager.get_scene_list()
+                video_manager.release()
+                
+                if not scene_list:
+                    logger.warning(f"No scenes detected in {file}")
+                    return 'skipped'
+                
+                logger.info(f"Detected {len(scene_list)} scenes")
+                
+                # Get frame rate
+                info = self.get_video_info(file)
+                fps = info['video']['fps'] if info.get('video') else 24.0
+                
+                # Extract scenes
+                for i, (start_time, end_time) in enumerate(scene_list, 1):
+                    scene_file = file.parent / f"{file.stem}_scene{i:03d}.mkv"
+                    
+                    if scene_file.exists():
+                        logger.info(f"Scene file already exists: {scene_file}")
+                        continue
+                    
+                    start_seconds = start_time.get_seconds()
+                    end_seconds = end_time.get_seconds()
+                    
+                    logger.info(f"Extracting scene {i}/{len(scene_list)}: "
+                              f"{start_seconds:.2f}s - {end_seconds:.2f}s")
+                    
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-ss', str(start_seconds),
+                        '-i', str(file),
+                        '-to', str(end_seconds - start_seconds),
+                        '-c:v', 'ffv1', '-level', '3',
+                        '-coder', '1', '-context', '1',
+                        '-g', '1', '-slices', '16', '-slicecrc', '1',
+                        '-c:a', 'flac', '-ac', '2',
+                        '-metadata', f'title=Scene {i} from {file.stem}',
+                        '-f', 'matroska',
+                        str(scene_file)
+                    ]
+                    
+                    result = self.run_command(cmd, show_progress=True)
+                    if result.returncode != 0:
+                        logger.error(f"Failed to extract scene {i}")
+                
+                return 'processed'
+                
+            except Exception as e:
+                logger.error(f"Scene detection failed for {file}: {e}")
+                return 'error'
+        
+        self.process_files([selected_file], "Split into Scenes", process_scenes)
+    
+    # === Operation 10: Repair with Untrunc ===
+    def repair_with_untrunc(self):
+        """Repair corrupted video files using untrunc"""
+        # Check if untrunc is available
+        if not shutil.which('untrunc'):
+            logger.error("untrunc not found in PATH. Please install untrunc first.")
+            return
+        
+        files = self.get_video_files()
+        if not files:
+            logger.warning("No video files found in current directory")
+            return
+        
+        print("\nSelect the corrupted video file to repair:")
+        for i, file in enumerate(files, 1):
+            print(f"{i}. {file.name}")
+        
+        try:
+            choice = int(input("Enter file number: ").strip()) - 1
+            if choice < 0 or choice >= len(files):
+                raise ValueError()
+            corrupted_file = files[choice]
+        except (ValueError, IndexError):
+            logger.error("Invalid selection")
+            return
+        
+        # Find reference files of the same type
+        ref_files = [f for f in files if f != corrupted_file and f.suffix == corrupted_file.suffix]
+        if not ref_files:
+            logger.error(f"No reference {corrupted_file.suffix} files found. Untrunc needs a good reference file.")
+            return
+        
+        print(f"\nSelect a good reference {corrupted_file.suffix} file (from same camera/source):")
+        for i, file in enumerate(ref_files, 1):
+            print(f"{i}. {file.name}")
+        
+        try:
+            choice = int(input("Enter file number: ").strip()) - 1
+            if choice < 0 or choice >= len(ref_files):
+                raise ValueError()
+            reference_file = ref_files[choice]
+        except (ValueError, IndexError):
+            logger.error("Invalid selection")
+            return
+        
+        def process_untrunc(file: Path):
+            output_file = file.with_name(f"{file.stem}_fixed{file.suffix}")
+            
+            if output_file.exists():
+                logger.info(f"Output file already exists: {output_file}")
+                return 'skipped'
+            
+            logger.info(f"Running untrunc with reference: {reference_file.name}")
+            
+            cmd = [
+                'untrunc',
+                str(reference_file),
+                str(file)
+            ]
+            
+            result = self.run_command(cmd, capture_output=False)
+            
+            # Check if untrunc created the output file
+            expected_output = file.with_name(f"{file.stem}_fixed{file.suffix}")
+            if expected_output.exists():
+                logger.info(f"Successfully repaired: {expected_output}")
+                return 'processed'
+            else:
+                logger.error("Untrunc failed to create output file")
+                return 'error'
+        
+        self.process_files([corrupted_file], "Repair with Untrunc", process_untrunc)
+
+
+def display_menu():
+    """Display the main menu"""
+    print("\n" + "="*60)
+    print("VIDEO SWISS ARMY KNIFE")
+    print("="*60)
+    print("1.  Reverse and Append Video (create video with reversed copy)")
+    print("2.  Remove Spaces from Filenames")
+    print("3.  Create Slow Motion Videos")
+    print("4.  Move Videos by Resolution (specify exact dimensions)")
+    print("5.  Move High FPS Videos (>30fps) to folder")
+    print("6.  Repair Corrupted WMV/ASF Files (ProRes)")
+    print("7.  Convert MKV to H.265 MP4")
+    print("8.  Convert Videos to WebM (VP8/Vorbis)")
+    print("9.  Split Videos into Scenes")
+    print("10. Repair Video with Untrunc")
+    print("0.  Exit")
+    print("="*60)
+
+
+def main():
+    """Main program loop"""
+    logger.info("="*60)
+    logger.info("Video Swiss Army Knife started")
+    logger.info(f"Working directory: {os.getcwd()}")
+    logger.info("="*60)
+    
+    while True:
+        display_menu()
+        choice = input("Select operation (0-10): ").strip()
+        
+        if choice == '0':
+            logger.info("Exiting Video Swiss Army Knife")
+            break
+        
+        with VideoProcessor() as processor:
+            operations = {
+                '1': processor.reverse_append_video,
+                '2': processor.remove_spaces_from_filenames,
+                '3': processor.create_slow_motion,
+                '4': processor.move_videos_by_resolution,
+                '5': processor.move_high_fps_videos,
+                '6': processor.repair_wmv_files,
+                '7': processor.convert_mkv_to_h265,
+                '8': processor.convert_to_webm,
+                '9': processor.split_into_scenes,
+                '10': processor.repair_with_untrunc
+            }
+            
+            if choice in operations:
+                try:
+                    operations[choice]()
+                except KeyboardInterrupt:
+                    logger.info("\nOperation cancelled by user")
+                except Exception as e:
+                    logger.error(f"Unexpected error: {e}")
+                    logger.debug(traceback.format_exc())
+            else:
+                logger.error("Invalid choice. Please select 0-10.")
+        
+        input("\nPress Enter to continue...")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("\nProgram interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"Critical error: {e}")
+        logger.debug(traceback.format_exc())
+        sys.exit(1)
